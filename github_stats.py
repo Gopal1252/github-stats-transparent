@@ -40,8 +40,8 @@ class Queries(object):
                                             headers=headers,
                                             json={"query": generated_query})
             return await r.json()
-        except:
-            print("aiohttp failed for GraphQL query")
+        except Exception as e:
+            print(f"aiohttp failed for GraphQL query: {e!r}")
             # Fall back on non-async requests
             async with self.semaphore:
                 r = requests.post("https://api.github.com/graphql",
@@ -288,30 +288,29 @@ Languages:
             )
             raw_results = raw_results if raw_results is not None else {}
 
-            self._name = (raw_results
-                          .get("data", {})
-                          .get("viewer", {})
-                          .get("name", None))
-            if self._name is None:
-                self._name = (raw_results
-                              .get("data", {})
-                              .get("viewer", {})
-                              .get("login", "No Name"))
+            # The API returns partial data alongside an "errors" array when it
+            # cannot resolve some repos. Surface it so failures are debuggable.
+            if raw_results.get("errors"):
+                print(f"GraphQL query returned errors: {raw_results['errors']}")
 
-            contrib_repos = (raw_results
-                             .get("data", {})
-                             .get("viewer", {})
-                             .get("repositoriesContributedTo", {}))
-            owned_repos = (raw_results
-                           .get("data", {})
-                           .get("viewer", {})
-                           .get("repositories", {}))
-            
-            repos = owned_repos.get("nodes", [])
+            viewer = (raw_results.get("data") or {}).get("viewer") or {}
+
+            self._name = viewer.get("name", None)
+            if self._name is None:
+                self._name = viewer.get("login", "No Name")
+
+            contrib_repos = viewer.get("repositoriesContributedTo") or {}
+            owned_repos = viewer.get("repositories") or {}
+
+            # Unresolvable repos come back as null nodes, so filter them out
+            owned_nodes = [r for r in (owned_repos.get("nodes") or []) if r]
+            contrib_nodes = [r for r in (contrib_repos.get("nodes") or []) if r]
+
+            repos = owned_nodes
             if self._consider_forked_repos:
-                repos += contrib_repos.get("nodes", [])
+                repos += contrib_nodes
             else:
-                for repo in contrib_repos.get("nodes", []):
+                for repo in contrib_nodes:
                     name = repo.get("nameWithOwner")
                     if name in self._ignored_repos or name in self._exclude_repos:
                         continue
@@ -322,10 +321,10 @@ Languages:
                 if name in self._repos or name in self._exclude_repos:
                     continue
                 self._repos.add(name)
-                self._stargazers += repo.get("stargazers").get("totalCount", 0)
+                self._stargazers += (repo.get("stargazers") or {}).get("totalCount", 0)
                 self._forks += repo.get("forkCount", 0)
 
-                for lang in repo.get("languages", {}).get("edges", []):
+                for lang in (repo.get("languages") or {}).get("edges", []):
                     name = lang.get("node", {}).get("name", "Other")
                     languages = await self.languages
                     if name in self._exclude_langs: continue
@@ -339,14 +338,12 @@ Languages:
                             "color": lang.get("node", {}).get("color")
                         }
 
-            if owned_repos.get("pageInfo", {}).get("hasNextPage", False) or \
-                    contrib_repos.get("pageInfo", {}).get("hasNextPage", False):
-                next_owned = (owned_repos
-                              .get("pageInfo", {})
-                              .get("endCursor", next_owned))
-                next_contrib = (contrib_repos
-                                .get("pageInfo", {})
-                                .get("endCursor", next_contrib))
+            owned_page = owned_repos.get("pageInfo") or {}
+            contrib_page = contrib_repos.get("pageInfo") or {}
+            if owned_page.get("hasNextPage", False) or \
+                    contrib_page.get("hasNextPage", False):
+                next_owned = owned_page.get("endCursor", next_owned)
+                next_contrib = contrib_page.get("endCursor", next_contrib)
             else:
                 break
 
@@ -354,7 +351,7 @@ Languages:
         #       specific filetypes
         langs_total = sum([v.get("size", 0) for v in self._languages.values()])
         for k, v in self._languages.items():
-            v["prop"] = 100 * (v.get("size", 0) / langs_total)
+            v["prop"] = 100 * (v.get("size", 0) / langs_total) if langs_total else 0
 
     @property
     async def name(self) -> str:
